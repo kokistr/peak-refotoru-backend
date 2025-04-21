@@ -68,4 +68,4 @@ jobs:
         with:
           app-name: 'tech0-gen-8-step4-peak-back'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2B6A5ECBE3D8459988C2067093E669A4 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_47E1BD5218E24183A92F049D65B82046 }}

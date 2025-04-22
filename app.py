@@ -1,11 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends #後半3つ安田追加
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles #安田追加
-from fastapi.responses import FileResponse #安田追加
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
 import os
 import uuid
-import cv2 #安田追加
+import cv2
 import tempfile
 import mysql.connector
 from mysql.connector import Error
@@ -13,26 +13,23 @@ from dotenv import load_dotenv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import numpy as np #安田追加
-import base64 #安田追加
-import shutil #安田追加
-from typing import List, Optional #安田追加
-from pydantic import BaseModel #安田追加
-import io #安田追加
-
-
-
+import numpy as np
+import base64
+import shutil
+from typing import List, Optional
+from pydantic import BaseModel
+import io
 
 app = FastAPI()
 
-# .env ファイルを読み込む
-load_dotenv() ## ローカルではここが必要なのでコメントアウトを外す。合わせて.envも作成（4/4 羽田野）
+# デプロイ環境では環境変数が直接設定されるため、load_dotenv()は開発環境でのみ使用
+if os.getenv("AZURE_ENVIRONMENT") != "production":
+    load_dotenv()
 
-# CORSミドルウェアの設定　※デプロイ時要変更
+# CORSミドルウェアの設定
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=["*"],
-    allow_origins=["http://localhost:3000"],  # Next.jsのローカルのデフォルトポート指定（4/4 羽田野）   # これでもいいっぽい allow_origins=[os.getenv("CORS_ORIGINS", "http://localhost:3000")],
+    allow_origins=["https://tech0-gen-8-step4-peak-front-d2ayf3aca3e3bcdu.canadacentral-01.azurewebsites.net"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,7 +55,7 @@ SSL_CA_CERT = os.getenv("SSL_CA_CERT")
 if not SSL_CA_CERT:
     raise ValueError(":x: SSL_CA_CERT が設定されていません！")
 
-# # SSL証明書の一時ファイル作成
+# SSL証明書の一時ファイル作成
 def create_ssl_cert_tempfile():
     pem_content = SSL_CA_CERT.replace("\\n", "\n").replace("\\", "")
     temp_pem = tempfile.NamedTemporaryFile(delete=False, suffix=".pem", mode="w")
@@ -68,16 +65,17 @@ def create_ssl_cert_tempfile():
 
 SSL_CA_PATH = create_ssl_cert_tempfile()
 
-# ------ここから------
-# アップロード用ディレクトリを作成
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+# Azure環境ではApp Serviceのファイルシステムは一時的なもの
+# 以下のディレクトリはローカルでの処理にのみ使用
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(f"{UPLOAD_DIR}/masks", exist_ok=True)
 os.makedirs(f"{UPLOAD_DIR}/results", exist_ok=True)
 os.makedirs(f"{UPLOAD_DIR}/materials", exist_ok=True)
 
-# 静的ファイル配信設定
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# 静的ファイル配信設定（開発環境のみ）
+if os.getenv("AZURE_ENVIRONMENT") != "production":
+    app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # リクエスト/レスポンスモデル
 class ProcessRequest(BaseModel):
@@ -89,36 +87,61 @@ class MaterialRequest(BaseModel):
     mask_id: str
     material_id: str
 
+# Blobヘルパー関数
+async def save_to_blob_storage(file_content, blob_name, content_type=None):
+    """ファイルをBlobストレージに保存し、URLを返す"""
+    try:
+        # Blobクライアントの取得
+        blob_client = container_client.get_blob_client(blob_name)
+        
+        # アップロード
+        blob_client.upload_blob(file_content, overwrite=True, content_settings=None)
+        
+        # URLを返す
+        return blob_client.url
+    except Exception as e:
+        print(f"Blobストレージエラー: {e}")
+        raise
 
-    
+async def get_blob_content(blob_name):
+    """Blobからコンテンツを取得"""
+    try:
+        blob_client = container_client.get_blob_client(blob_name)
+        download_stream = blob_client.download_blob()
+        return await download_stream.readall()
+    except Exception as e:
+        print(f"Blob取得エラー: {e}")
+        raise
+
 # データベース接続関数
 def get_db_connection():
     """データベース接続を取得"""
     connection = None
     try:
         connection = mysql.connector.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            database=os.getenv("DB_NAME", "refotoru_db"),
-            user=os.getenv("DB_USER", "root"),
-            password=os.getenv("DB_PASSWORD", "")
+            host=DB_HOST,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            port=DB_PORT,
+            ssl_ca=SSL_CA_PATH
         )
         return connection
     except Error as e:
         print(f"データベース接続エラー: {e}")
         if connection and connection.is_connected():
             connection.close()
-        raise HTTPException(status_code=500, detail=f"データベース接続エラー: {str(e)}")    
-    
+        raise HTTPException(status_code=500, detail=f"データベース接続エラー: {str(e)}")
 
-
-# ▼▼▼以下、/安田がlocalhost:8000/api/db-infoでDBの中身見るための実装用の処理▼▼▼
+# API: データベース情報取得
 @app.get("/api/db-info")
 async def get_db_info():
     """
     データベース情報を取得するAPI（開発用）
     """
-    # if os.getenv("ENVIRONMENT") != "development":
-    #     raise HTTPException(status_code=403, detail="この操作は開発環境でのみ許可されています")
+    # 本番環境では無効化
+    if os.getenv("AZURE_ENVIRONMENT") == "production":
+        raise HTTPException(status_code=403, detail="この操作は開発環境でのみ許可されています")
     
     try:
         conn = get_db_connection()
@@ -169,181 +192,52 @@ async def get_db_info():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"データベース情報取得エラー: {str(e)}")
-  
-    
-# ------ここまで安田------
 
-
-
-# ▼▼▼以下、/upload画面での処理▼▼▼
-def store_image_metadata(filename: str, blob_url: str):
-    """アップロードした画像のメタデータをMySQLに保存する"""
+# API: 画像アップロード
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
     try:
-        connection = mysql.connector.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            port=DB_PORT,
-            ssl_ca=SSL_CA_PATH  # SSL CA証明書を使ったセキュア接続
-        )
-        if connection.is_connected():
-            cursor = connection.cursor()
+        # ファイル名の生成
+        filename = f"{uuid.uuid4()}.{file.filename.split('.')[-1]}"
+        
+        # ファイルを読み込む
+        file_content = await file.read()
+        
+        # BlobStorageに直接アップロード
+        blob_url = await save_to_blob_storage(file_content, filename)
+        
+        # データベースに情報を保存
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        try:
             query = """
                 INSERT INTO upload_images (filename, blob_url, upload_date)
                 VALUES (%s, %s, %s)
             """
-            # 正しい時間で保存するため、日本標準時（Asia/Tokyo）を ZoneInfo で指定
+            # 日本標準時で保存
             jst = ZoneInfo("Asia/Tokyo")
             upload_date = datetime.now(jst).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute(query, (filename, blob_url, upload_date))
             connection.commit()
+        finally:
             cursor.close()
-        connection.close()
-    except Error as e:
-        print(f"Database error: {e}")
-    finally:
-        if connection.is_connected():
             connection.close()
-
-@app.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
-    try:
-        # 画像ファイルを一時的に保存するために、一時ディレクトリを取得
-        temp_dir = tempfile.gettempdir()  # OSに依存せず、一時ファイル用のディレクトリを取得
-        filename = f"{uuid.uuid4()}.{file.filename.split('.')[-1]}"
-        file_path = os.path.join(temp_dir, filename)  # 一時ファイルの保存パスを組み立て
-
-        # ファイルを一時保存
-        with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
-
-        # BlobStorageに画像をアップロード
-        blob_client = container_client.get_blob_client(filename)
-        with open(file_path, "rb") as data:
-            blob_client.upload_blob(data, overwrite=True)
-
-        # アップロードしたBlobのURLを取得
-        blob_url = blob_client.url
-
-        # データベースに情報を保存
-        store_image_metadata(filename, blob_url)
-
-        # 一時ファイルを削除
-        os.remove(file_path)
-
+            
         return {
             "message": "画像が正常にアップロードされました", 
             "filename": filename,
-            "blob_url": blob_url}
-
-    except Exception as e:
-        return {"error": str(e)}
-    
-
-
-# ▼▼▼以下、/category画面での処理▼▼▼  
-
-# 画像のマスク処理関数
-@app.post("/api/process")
-async def process_mask(request: ProcessRequest):
-    """
-    ユーザーが描いたマスク領域を処理
-    """
-    print(f"===== マスク処理開始: image_id {request.image_id} =====")
-    print(f"マスクデータ長さ: {len(request.mask_data) if request.mask_data else 'なし'}")
-    
-    connection = None
-    cursor = None
-    try:
-        # 元画像の情報を取得
-        print("元画像情報取得中...")
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        
-        # まずupload_idで検索を試み、なければfilename検索を行う
-        cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
-                      (request.image_id, request.image_id))
-        image_info = cursor.fetchone()
-        
-        if not image_info:
-            print(f"画像が見つかりません: {request.image_id}")
-            raise HTTPException(status_code=404, detail="画像が見つかりません")
-        
-        print(f"元画像情報: {image_info}")
-        
-        # 画像のファイルパスを取得
-        original_path = os.path.join(UPLOAD_DIR, image_info["filename"])
-        
-        # 画像がローカルになければダウンロード
-        if not os.path.exists(original_path):
-            # Blob URLから画像をダウンロード
-            print(f"Blob URLから画像をダウンロードします: {image_info['blob_url']}")
-            try:
-                import requests
-                response = requests.get(image_info["blob_url"])
-                if response.status_code == 200:
-                    with open(original_path, "wb") as f:
-                        f.write(response.content)
-                    print(f"画像をダウンロードしました: {original_path}")
-                else:
-                    print(f"画像のダウンロードに失敗: ステータスコード {response.status_code}")
-                    raise HTTPException(status_code=500, detail=f"画像のダウンロードに失敗しました: ステータスコード {response.status_code}")
-            except Exception as download_error:
-                print(f"画像ダウンロードエラー: {download_error}")
-                raise HTTPException(status_code=500, detail=f"画像ダウンロードエラー: {str(download_error)}")
-        
-        # マスク処理
-        mask_id = str(uuid.uuid4())
-        mask_path = f"{UPLOAD_DIR}/masks/{mask_id}.png"
-        print(f"生成されたmask_id: {mask_id}")
-        print(f"マスク保存先: {mask_path}")
-        
-        # マスクデータを処理して保存
-        print("マスク画像処理中...")
-        if not process_mask_image(request.mask_data, mask_path):
-            print("マスク処理失敗")
-            raise HTTPException(status_code=500, detail="マスク処理に失敗しました")
-        print("マスク処理成功")
-        
-        # データベースにマスク情報を保存
-        print("マスク情報をデータベースに保存中...")
-        cursor.execute(
-            "INSERT INTO masks (mask_id, image_id, mask_path, created_at) VALUES (%s, %s, %s, NOW())",
-            (mask_id, image_info["filename"], mask_path)  # filenameを保存（一貫性のため）
-        )
-        connection.commit()
-        print("マスク情報保存成功")
-        
-        print(f"===== マスク処理完了 =====")
-        return {
-            "success": True,
-            "image_id": image_info["filename"],  # 一貫性のためfilename返却
-            "mask_id": mask_id,
-            "mask_path": mask_path,
-            "public_url": f"/uploads/masks/{mask_id}.png"
+            "blob_url": blob_url
         }
-    
-    except HTTPException:
-        # HTTPExceptionはそのまま再送
-        raise
     except Exception as e:
-        print(f"マスク処理エラー: {e}")
-        raise HTTPException(status_code=500, detail=f"マスク処理エラー: {str(e)}")
-    finally:
-        # リソースの確実な解放
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
-
-
+        print(f"アップロードエラー: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 # 画像処理ヘルパー関数
 def process_mask_image(mask_data_base64, output_path):
-    """
-    Base64マスクデータを処理して保存
-    """
+    """Base64マスクデータを処理して保存"""
     print("==== process_mask_image関数開始 ====")
     try:
         # Base64から画像データを取得
@@ -381,10 +275,148 @@ def process_mask_image(mask_data_base64, output_path):
         print("==== process_mask_image関数終了: 失敗 ====")
         return False
 
+# API: マスク処理
+@app.post("/api/process")
+async def process_mask(request: ProcessRequest):
+    """ユーザーが描いたマスク領域を処理"""
+    print(f"===== マスク処理開始: image_id {request.image_id} =====")
+    
+    connection = None
+    cursor = None
+    try:
+        # 元画像の情報を取得
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        cursor.execute(
+            "SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
+            (request.image_id, request.image_id)
+        )
+        image_info = cursor.fetchone()
+        
+        if not image_info:
+            raise HTTPException(status_code=404, detail="画像が見つかりません")
+        
+        # マスク処理
+        mask_id = str(uuid.uuid4())
+        mask_filename = f"{mask_id}.png"
+        mask_path = f"{UPLOAD_DIR}/masks/{mask_filename}"
+        
+        # マスクデータを処理して一時ファイルに保存
+        if not process_mask_image(request.mask_data, mask_path):
+            raise HTTPException(status_code=500, detail="マスク処理に失敗しました")
+        
+        # 一時ファイルをBlobストレージにアップロード
+        with open(mask_path, "rb") as f:
+            mask_blob_url = await save_to_blob_storage(f.read(), f"masks/{mask_filename}")
+        
+        # データベースにマスク情報を保存 - mask_pathカラムにBlobのURLを保存
+        cursor.execute(
+            "INSERT INTO masks (mask_id, image_id, mask_path, created_at) VALUES (%s, %s, %s, NOW())",
+            (mask_id, image_info["filename"], mask_blob_url)  # mask_pathにBlobのURLを保存
+        )
+        connection.commit()
+        
+        # Azureでのパブリックアクセス用URL
+        public_url = mask_blob_url
+        
+        return {
+            "success": True,
+            "image_id": image_info["filename"],
+            "mask_id": mask_id,
+            "mask_path": mask_path,
+            "public_url": public_url
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"マスク処理エラー: {e}")
+        raise HTTPException(status_code=500, detail=f"マスク処理エラー: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
+# 素材を適用する処理
+def apply_material_to_image(original_path, mask_path, material_path, output_path):
+    """
+    マスク領域に素材を適用
+    """
+    print(f"==== 素材適用処理開始 ====")
+    print(f"元画像: {original_path}")
+    print(f"マスク: {mask_path}")
+    print(f"素材: {material_path}")
+    print(f"出力先: {output_path}")
+    
+    try:
+        # 画像読み込み
+        print("画像読み込み中...")
+        original = cv2.imread(original_path)
+        if original is None:
+            print(f"元画像の読み込みに失敗: {original_path}")
+            return False
+        
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print(f"マスク画像の読み込みに失敗: {mask_path}")
+            return False
+        
+        material = cv2.imread(material_path)
+        if material is None:
+            print(f"素材画像の読み込みに失敗: {material_path}")
+            return False
+        
+        print(f"元画像サイズ: {original.shape}")
+        print(f"マスクサイズ: {mask.shape}")
+        print(f"素材サイズ: {material.shape}")
+        
+        # サイズ調整
+        print("素材画像をリサイズ中...")
+        material = cv2.resize(material, (original.shape[1], original.shape[0]))
+        print(f"リサイズ後の素材サイズ: {material.shape}")
+        
+        # マスク処理
+        print("マスク状態を確認中...")
+        mask_mean = np.mean(mask)
+        print(f"マスクの平均輝度値: {mask_mean}")
+        
+        if np.mean(mask) > 127:  # マスクが主に白の場合
+            print("マスクが白い領域を主に含むため反転します")
+            mask_inv = cv2.bitwise_not(mask)  # 反転して黒を選択領域にする
+        else:
+            print("マスクが黒い領域を主に含むため反転しません")
+            mask_inv = mask  # すでに黒が選択領域の場合
+            mask = cv2.bitwise_not(mask_inv)  # 白を非選択領域にする
+        
+        # 背景（マスクされていない領域）
+        print("背景処理中...")
+        background = cv2.bitwise_and(original, original, mask=mask)
+        
+        # 前景（マスクされた領域に素材を適用）
+        print("前景処理中...")
+        foreground = cv2.bitwise_and(material, material, mask=mask_inv)
+        
+        # 合成
+        print("画像合成中...")
+        result = cv2.add(background, foreground)
+        
+        # 結果を保存
+        print(f"結果を保存中: {output_path}")
+        save_success = cv2.imwrite(output_path, result)
+        if not save_success:
+            print(f"結果の保存に失敗しました: {output_path}")
+            return False
+        
+        print(f"==== 素材適用処理完了: 成功 ====")
+        return True
+    except Exception as e:
+        print(f"素材適用エラー: {e}")
+        print(f"==== 素材適用処理完了: 失敗 ====")
+        return False
 
-# ▼▼▼以下、/material画面での処理▼▼▼
-# 素材データをDBから引っ張って画面に表示する
+# API: 素材一覧取得
 @app.get("/api/materials/{category}")
 async def get_materials_by_category(category: str):
     """
@@ -463,85 +495,7 @@ async def get_materials_by_category(category: str):
         if connection and connection.is_connected():
             connection.close()
 
-
-def apply_material_to_image(original_path, mask_path, material_path, output_path):
-    """
-    マスク領域に素材を適用
-    """
-    print(f"==== 素材適用処理開始 ====")
-    print(f"元画像: {original_path}")
-    print(f"マスク: {mask_path}")
-    print(f"素材: {material_path}")
-    print(f"出力先: {output_path}")
-    
-    try:
-        # 画像読み込み
-        print("画像読み込み中...")
-        original = cv2.imread(original_path)
-        if original is None:
-            print(f"元画像の読み込みに失敗: {original_path}")
-            return False
-        
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            print(f"マスク画像の読み込みに失敗: {mask_path}")
-            return False
-        
-        material = cv2.imread(material_path)
-        if material is None:
-            print(f"素材画像の読み込みに失敗: {material_path}")
-            return False
-        
-        print(f"元画像サイズ: {original.shape}")
-        print(f"マスクサイズ: {mask.shape}")
-        print(f"素材サイズ: {material.shape}")
-        
-        # サイズ調整
-        print("素材画像をリサイズ中...")
-        material = cv2.resize(material, (original.shape[1], original.shape[0]))
-        print(f"リサイズ後の素材サイズ: {material.shape}")
-        
-        # マスク処理
-        print("マスク状態を確認中...")
-        mask_mean = np.mean(mask)
-        print(f"マスクの平均輝度値: {mask_mean}")
-        
-        if np.mean(mask) > 127:  # マスクが主に白の場合
-            print("マスクが白い領域を主に含むため反転します")
-            mask_inv = cv2.bitwise_not(mask)  # 反転して黒を選択領域にする
-        else:
-            print("マスクが黒い領域を主に含むため反転しません")
-            mask_inv = mask  # すでに黒が選択領域の場合
-            mask = cv2.bitwise_not(mask_inv)  # 白を非選択領域にする
-        
-        # 背景（マスクされていない領域）
-        print("背景処理中...")
-        background = cv2.bitwise_and(original, original, mask=mask)
-        
-        # 前景（マスクされた領域に素材を適用）
-        print("前景処理中...")
-        foreground = cv2.bitwise_and(material, material, mask=mask_inv)
-        
-        # 合成
-        print("画像合成中...")
-        result = cv2.add(background, foreground)
-        
-        # 結果を保存
-        print(f"結果を保存中: {output_path}")
-        save_success = cv2.imwrite(output_path, result)
-        if not save_success:
-            print(f"結果の保存に失敗しました: {output_path}")
-            return False
-        
-        print(f"==== 素材適用処理完了: 成功 ====")
-        return True
-    except Exception as e:
-        print(f"素材適用エラー: {e}")
-        print(f"==== 素材適用処理完了: 失敗 ====")
-        return False
-
-
-
+# API: 素材適用
 @app.post("/api/apply-material")
 async def apply_material(request: MaterialRequest):
     """
@@ -554,7 +508,6 @@ async def apply_material(request: MaterialRequest):
     cursor = None
     try:
         # 必要な情報を取得
-        print("データベースから情報取得中...")
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
         
@@ -563,37 +516,13 @@ async def apply_material(request: MaterialRequest):
                       (request.image_id, request.image_id))
         image_info = cursor.fetchone()
         if not image_info:
-            print(f"画像が見つかりません: {request.image_id}")
             raise HTTPException(status_code=404, detail="画像が見つかりません")
-        print(f"画像情報: {image_info}")
-        
-        # 画像のファイルパスを取得
-        original_path = os.path.join(UPLOAD_DIR, image_info["filename"])
-        # 画像がローカルになければダウンロード
-        if not os.path.exists(original_path):
-            # Blob URLから画像をダウンロード
-            print(f"Blob URLから画像をダウンロードします: {image_info['blob_url']}")
-            try:
-                import requests
-                response = requests.get(image_info["blob_url"])
-                if response.status_code == 200:
-                    with open(original_path, "wb") as f:
-                        f.write(response.content)
-                    print(f"画像をダウンロードしました: {original_path}")
-                else:
-                    print(f"画像のダウンロードに失敗: ステータスコード {response.status_code}")
-                    raise HTTPException(status_code=500, detail=f"画像のダウンロードに失敗しました: ステータスコード {response.status_code}")
-            except Exception as download_error:
-                print(f"画像ダウンロードエラー: {download_error}")
-                raise HTTPException(status_code=500, detail=f"画像ダウンロードエラー: {str(download_error)}")
         
         # マスク情報
         cursor.execute("SELECT * FROM masks WHERE mask_id = %s", (request.mask_id,))
         mask_info = cursor.fetchone()
         if not mask_info:
-            print(f"マスクが見つかりません: {request.mask_id}")
             raise HTTPException(status_code=404, detail="マスクが見つかりません")
-        print(f"マスク情報: {mask_info}")
         
         # 素材情報 - image_idまたはproduct_idで検索
         cursor.execute("""
@@ -604,52 +533,53 @@ async def apply_material(request: MaterialRequest):
         """, (request.material_id, request.material_id))
         material_info = cursor.fetchone()
         if not material_info:
-            print(f"素材が見つかりません: {request.material_id}")
             raise HTTPException(status_code=404, detail="素材が見つかりません")
-        print(f"素材情報: {material_info}")
         
-        # 素材画像のパスを決定
-        materials_dir = os.path.join(UPLOAD_DIR, "materials")
-        os.makedirs(materials_dir, exist_ok=True)
-        material_filename = f"{material_info['product_id']}.jpg"
-        material_path = os.path.join(materials_dir, material_filename)
+        # 元画像、マスク、素材を一時ディレクトリにダウンロード
+        temp_original_path = os.path.join(UPLOAD_DIR, f"temp_original_{uuid.uuid4()}.jpg")
+        temp_mask_path = os.path.join(UPLOAD_DIR, f"temp_mask_{uuid.uuid4()}.png")
+        temp_material_path = os.path.join(UPLOAD_DIR, f"temp_material_{uuid.uuid4()}.jpg")
         
-        # 素材がローカルになければダウンロード
-        if not os.path.exists(material_path):
-            print(f"素材をダウンロードします: {material_info['image_url']}")
-            try:
-                import requests
-                response = requests.get(material_info["image_url"])
-                if response.status_code == 200:
-                    with open(material_path, "wb") as f:
-                        f.write(response.content)
-                    print(f"素材をダウンロードしました: {material_path}")
-                else:
-                    print(f"素材のダウンロードに失敗: ステータスコード {response.status_code}")
-                    raise HTTPException(status_code=500, detail=f"素材のダウンロードに失敗しました: ステータスコード {response.status_code}")
-            except Exception as download_error:
-                print(f"素材ダウンロードエラー: {download_error}")
-                raise HTTPException(status_code=500, detail=f"素材ダウンロードエラー: {str(download_error)}")
+        # 元画像をダウンロード
+        import requests
+        response = requests.get(image_info["blob_url"])
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="元画像のダウンロードに失敗しました")
+        with open(temp_original_path, "wb") as f:
+            f.write(response.content)
+        
+        # マスクをダウンロード - mask_pathにはBlobのURLが保存されている
+        response = requests.get(mask_info["mask_path"])
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="マスクのダウンロードに失敗しました")
+        with open(temp_mask_path, "wb") as f:
+            f.write(response.content)
+        
+        # 素材をダウンロード
+        response = requests.get(material_info["image_url"])
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="素材のダウンロードに失敗しました")
+        with open(temp_material_path, "wb") as f:
+            f.write(response.content)
         
         # 合成処理
         result_id = str(uuid.uuid4())
-        result_path = f"{UPLOAD_DIR}/results/{result_id}.jpg"
-        print(f"生成されたresult_id: {result_id}")
-        print(f"結果保存先: {result_path}")
+        temp_result_path = os.path.join(UPLOAD_DIR, f"results/{result_id}.jpg")
         
         # 素材を適用
-        print("素材適用処理を実行中...")
         if not apply_material_to_image(
-            original_path, 
-            mask_info["mask_path"], 
-            material_path, 
-            result_path
+            temp_original_path, 
+            temp_mask_path, 
+            temp_material_path, 
+            temp_result_path
         ):
-            print("素材適用処理に失敗")
             raise HTTPException(status_code=500, detail="素材適用に失敗しました")
         
-        # 結果をデータベースに保存
-        print("結果をデータベースに保存中...")
+        # 結果をBlobストレージにアップロード
+        with open(temp_result_path, "rb") as f:
+            result_blob_url = await save_to_blob_storage(f.read(), f"results/{result_id}.jpg")
+        
+        # 結果をデータベースに保存 - result_pathにBlobのURLを保存
         cursor.execute(
             """
             INSERT INTO results 
@@ -658,40 +588,38 @@ async def apply_material(request: MaterialRequest):
             """,
             (
                 result_id, 
-                image_info["filename"],  # 一貫性のためfilename
+                image_info["filename"],
                 request.mask_id, 
-                material_info["image_id"],  # 正しいmaterial_id（products_imageテーブルのimage_id）
-                result_path
+                material_info["image_id"],
+                result_blob_url  # result_pathにBlobのURLを保存
             )
         )
         connection.commit()
-        print("結果保存成功")
         
-        print(f"===== 素材適用API完了 =====")
+        # 一時ファイルの削除
+        for path in [temp_original_path, temp_mask_path, temp_material_path]:
+            if os.path.exists(path):
+                os.remove(path)
+        
         return {
             "success": True,
             "result_id": result_id,
-            "result_path": result_path,
-            "public_url": f"/uploads/results/{result_id}.jpg"
+            "result_path": temp_result_path,
+            "public_url": result_blob_url
         }
     
     except HTTPException:
-        # HTTPExceptionはそのまま再送
         raise
     except Exception as e:
         print(f"素材適用APIエラー: {e}")
         raise HTTPException(status_code=500, detail=f"素材適用エラー: {str(e)}")
     finally:
-        # リソースの確実な解放
         if cursor:
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
-            
 
-
-# ▼▼▼以下、/4-preview画面での処理▼▼▼
-# Before/Afterボタン各々押下で適切な画像を表示
+# API: Before画像取得
 @app.get("/api/preview/before/{image_id}")
 async def get_before_image(image_id: str):
     """
@@ -705,16 +633,13 @@ async def get_before_image(image_id: str):
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
         
-        # upload_idまたはfilenameで検索（filenameはそのまま検索）
+        # upload_idまたはfilenameで検索
         cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
                       (image_id, image_id))
         image_info = cursor.fetchone()
         
         if not image_info:
-            print(f"画像が見つかりません: {image_id}")
             raise HTTPException(status_code=404, detail="画像が見つかりません")
-        
-        print(f"画像情報: {image_info}")
         
         return {
             "image_id": image_info["filename"],
@@ -730,8 +655,7 @@ async def get_before_image(image_id: str):
         if connection and connection.is_connected():
             connection.close()
 
-
-
+# API: After画像取得
 @app.get("/api/preview/after/{image_id}/{mask_id}")
 async def get_after_image(image_id: str, mask_id: str):
     """
@@ -746,7 +670,6 @@ async def get_after_image(image_id: str, mask_id: str):
         cursor = connection.cursor(dictionary=True)
         
         # resultsテーブルから最新の合成画像を取得
-        # image_idはそのまま使用（拡張子を含む）
         cursor.execute("""
             SELECT * FROM results 
             WHERE image_id = %s AND mask_id = %s 
@@ -757,7 +680,7 @@ async def get_after_image(image_id: str, mask_id: str):
         
         if not result_info:
             print(f"合成画像が見つかりません: image_id={image_id}, mask_id={mask_id}")
-            # 画像が見つからない場合、代替として元の画像を取得することもできます
+            # 画像が見つからない場合、代替として元の画像を取得
             cursor.execute("SELECT * FROM upload_images WHERE filename = %s", (image_id,))
             original_image = cursor.fetchone()
             if original_image:
@@ -769,16 +692,11 @@ async def get_after_image(image_id: str, mask_id: str):
                 }
             raise HTTPException(status_code=404, detail="合成画像が見つかりません")
         
-        print(f"合成画像情報: {result_info}")
-        
-        # 結果画像のパスからURLを生成
-        result_path = result_info["result_path"]
-        public_url = f"/uploads/results/{result_info['result_id']}.jpg"
-        
+        # result_pathにはAzureでのBlobURLが保存されている
         return {
             "result_id": result_info["result_id"],
-            "result_path": result_path,
-            "public_url": public_url
+            "result_path": result_info["result_path"],
+            "public_url": result_info["result_path"]  # result_pathにBlobのURLを保存
         }
     
     except Exception as e:
@@ -790,15 +708,12 @@ async def get_after_image(image_id: str, mask_id: str):
         if connection and connection.is_connected():
             connection.close()
 
-
-
-# 追加: ルートエンドポイント　よくわかんないけど必要らしいのでコメントアウト外した（4/4 羽田野）
+# ルートエンドポイント
 @app.get("/")
 async def root():
-    return {"message": "FastAPI is running!"}
+    return {"message": "FastAPI is running on Azure!"}
 
-# Uvicornサーバー起動用　ローカル実行用に追加（4/4 羽田野）
-if __name__ == "__main__":
+# ローカル開発環境でのみUvicornサーバーを起動
+if __name__ == "__main__" and os.getenv("AZURE_ENVIRONMENT") != "production":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-

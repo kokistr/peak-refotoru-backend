@@ -28,7 +28,7 @@ app = FastAPI()
 # .env ファイルを読み込む
 load_dotenv() ## ローカルではここが必要なのでコメントアウトを外す。合わせて.envも作成（4/4 羽田野）
 
-# CORSミドルウェアの設定
+# CORSミドルウェアの設定　※デプロイ時要変更
 app.add_middleware(
     CORSMiddleware,
     # allow_origins=["*"],
@@ -74,6 +74,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(f"{UPLOAD_DIR}/masks", exist_ok=True)
 os.makedirs(f"{UPLOAD_DIR}/results", exist_ok=True)
+os.makedirs(f"{UPLOAD_DIR}/materials", exist_ok=True)
 
 # 静的ファイル配信設定
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -93,6 +94,7 @@ class MaterialRequest(BaseModel):
 # データベース接続関数
 def get_db_connection():
     """データベース接続を取得"""
+    connection = None
     try:
         connection = mysql.connector.connect(
             host=os.getenv("DB_HOST", "localhost"),
@@ -103,7 +105,9 @@ def get_db_connection():
         return connection
     except Error as e:
         print(f"データベース接続エラー: {e}")
-        raise HTTPException(status_code=500, detail=f"データベース接続エラー: {str(e)}")  
+        if connection and connection.is_connected():
+            connection.close()
+        raise HTTPException(status_code=500, detail=f"データベース接続エラー: {str(e)}")    
     
 
 
@@ -249,29 +253,33 @@ async def process_mask(request: ProcessRequest):
     print(f"===== マスク処理開始: image_id {request.image_id} =====")
     print(f"マスクデータ長さ: {len(request.mask_data) if request.mask_data else 'なし'}")
     
+    connection = None
+    cursor = None
     try:
-        # 元画像の情報を取得（upload_imagesテーブルから取得）
+        # 元画像の情報を取得
         print("元画像情報取得中...")
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        try:
-            # 修正: imagesテーブルではなくupload_imagesテーブルを参照
-            # また、image_idではなくfilenameカラムで検索
-            cursor.execute("SELECT * FROM upload_images WHERE filename = %s", (request.image_id,))
-            image_info = cursor.fetchone()
-            if not image_info:
-                print(f"画像が見つかりません: {request.image_id}")
-                raise HTTPException(status_code=404, detail="画像が見つかりません")
-            print(f"元画像情報: {image_info}")
-            
-            # 画像のファイルパスを取得（仮定：ローカルにも保存されている、または一時的に保存）
-            # 注意: Blobストレージからダウンロードするロジックがないため、ここでは仮定
-            original_path = os.path.join(UPLOAD_DIR, image_info["filename"])
-            # 画像がローカルになければダウンロード
-            if not os.path.exists(original_path):
-                # Blob URLから画像をダウンロード
-                print(f"Blob URLから画像をダウンロードします: {image_info['blob_url']}")
-                # 仮のダウンロード処理（実際の実装は環境に依存）
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # まずupload_idで検索を試み、なければfilename検索を行う
+        cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
+                      (request.image_id, request.image_id))
+        image_info = cursor.fetchone()
+        
+        if not image_info:
+            print(f"画像が見つかりません: {request.image_id}")
+            raise HTTPException(status_code=404, detail="画像が見つかりません")
+        
+        print(f"元画像情報: {image_info}")
+        
+        # 画像のファイルパスを取得
+        original_path = os.path.join(UPLOAD_DIR, image_info["filename"])
+        
+        # 画像がローカルになければダウンロード
+        if not os.path.exists(original_path):
+            # Blob URLから画像をダウンロード
+            print(f"Blob URLから画像をダウンロードします: {image_info['blob_url']}")
+            try:
                 import requests
                 response = requests.get(image_info["blob_url"])
                 if response.status_code == 200:
@@ -280,12 +288,11 @@ async def process_mask(request: ProcessRequest):
                     print(f"画像をダウンロードしました: {original_path}")
                 else:
                     print(f"画像のダウンロードに失敗: ステータスコード {response.status_code}")
-                    raise HTTPException(status_code=500, detail="画像のダウンロードに失敗しました")
-            
-        finally:
-            cursor.close()
-            conn.close()
-
+                    raise HTTPException(status_code=500, detail=f"画像のダウンロードに失敗しました: ステータスコード {response.status_code}")
+            except Exception as download_error:
+                print(f"画像ダウンロードエラー: {download_error}")
+                raise HTTPException(status_code=500, detail=f"画像ダウンロードエラー: {str(download_error)}")
+        
         # マスク処理
         mask_id = str(uuid.uuid4())
         mask_path = f"{UPLOAD_DIR}/masks/{mask_id}.png"
@@ -301,35 +308,36 @@ async def process_mask(request: ProcessRequest):
         
         # データベースにマスク情報を保存
         print("マスク情報をデータベースに保存中...")
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                "INSERT INTO masks (mask_id, image_id, mask_path, created_at) VALUES (%s, %s, %s, NOW())",
-                (mask_id, request.image_id, mask_path)
-            )
-            conn.commit()
-            print("マスク情報保存成功")
-        except Error as e:
-            print(f"マスク保存エラー: {e}")
-        finally:
-            cursor.close()
-            conn.close()
+        cursor.execute(
+            "INSERT INTO masks (mask_id, image_id, mask_path, created_at) VALUES (%s, %s, %s, NOW())",
+            (mask_id, image_info["filename"], mask_path)  # filenameを保存（一貫性のため）
+        )
+        connection.commit()
+        print("マスク情報保存成功")
         
         print(f"===== マスク処理完了 =====")
         return {
             "success": True,
-            "image_id": request.image_id,
+            "image_id": image_info["filename"],  # 一貫性のためfilename返却
             "mask_id": mask_id,
             "mask_path": mask_path,
             "public_url": f"/uploads/masks/{mask_id}.png"
         }
     
     except HTTPException:
+        # HTTPExceptionはそのまま再送
         raise
     except Exception as e:
         print(f"マスク処理エラー: {e}")
         raise HTTPException(status_code=500, detail=f"マスク処理エラー: {str(e)}")
+    finally:
+        # リソースの確実な解放
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
 
 # 画像処理ヘルパー関数
 def process_mask_image(mask_data_base64, output_path):
@@ -376,6 +384,86 @@ def process_mask_image(mask_data_base64, output_path):
 
 
 # ▼▼▼以下、/material画面での処理▼▼▼
+# 素材データをDBから引っ張って画面に表示する
+@app.get("/api/materials/{category}")
+async def get_materials_by_category(category: str):
+    """
+    カテゴリ別の素材一覧を取得
+    """
+    print(f"===== カテゴリ[{category}]の素材一覧取得開始 =====")
+    
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # データベースの全カテゴリを確認（デバッグ用）
+        cursor.execute("SELECT DISTINCT category FROM products")
+        categories = cursor.fetchall()
+        print(f"データベースの全カテゴリ: {[cat['category'] for cat in categories]}")
+        
+        # カテゴリに合致する素材を取得
+        query = """
+            SELECT pi.image_id, pi.product_id, pi.image_url, 
+                   p.category, p.series, p.color, p.price
+            FROM products_image pi
+            JOIN products p ON pi.product_id = p.product_id
+            WHERE p.category = %s
+            ORDER BY p.series, p.color
+        """
+        print(f"実行するSQL: {query} パラメータ: [{category}]")
+        cursor.execute(query, (category,))
+        
+        materials = cursor.fetchall()
+        print(f"クエリ結果: {len(materials)}件")
+        
+        if not materials:
+            # カテゴリに関するさらなる情報を取得
+            cursor.execute("SELECT COUNT(*) as count FROM products WHERE category = %s", (category,))
+            cat_count = cursor.fetchone()
+            print(f"category={category}の商品は{cat_count['count']}件存在します")
+            
+            # products_imageテーブルのチェック
+            cursor.execute("SELECT COUNT(*) as count FROM products_image")
+            img_count = cursor.fetchone()
+            print(f"products_imageテーブルには{img_count['count']}件のレコードが存在します")
+            
+            print(f"カテゴリ[{category}]の素材が見つかりません")
+            return {"materials": []}
+        
+        # 結果のサンプル出力
+        print(f"最初の素材サンプル: {materials[0]}")
+        
+        # 結果を整形して返す
+        result = [
+            {
+                "id": material["image_id"],
+                "product_id": material["product_id"],
+                "name": material["series"],
+                "color": material["color"],
+                "price": material["price"],
+                "image": material["image_url"]
+            }
+            for material in materials
+        ]
+        
+        print(f"===== カテゴリ[{category}]の素材一覧取得完了: {len(result)}件 =====")
+        return {"materials": result}
+    
+    except Exception as e:
+        print(f"素材一覧取得エラー: {e}")
+        # スタックトレースも出力
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"素材一覧取得エラー: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
 def apply_material_to_image(original_path, mask_path, material_path, output_path):
     """
     マスク領域に素材を適用
@@ -462,27 +550,30 @@ async def apply_material(request: MaterialRequest):
     print(f"===== 素材適用API開始 =====")
     print(f"リクエスト: image_id={request.image_id}, mask_id={request.mask_id}, material_id={request.material_id}")
     
+    connection = None
+    cursor = None
     try:
         # 必要な情報を取得
         print("データベースから情報取得中...")
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        try:
-            # 元画像情報
-            cursor.execute("SELECT * FROM upload_images WHERE filename = %s", (request.image_id,))
-            image_info = cursor.fetchone()
-            if not image_info:
-                print(f"画像が見つかりません: {request.image_id}")
-                raise HTTPException(status_code=404, detail="画像が見つかりません")
-            print(f"画像情報: {image_info}")
-            
-            # 画像のファイルパスを取得（仮定：ローカルにも保存されている、または一時的に保存）
-            original_path = os.path.join(UPLOAD_DIR, image_info["filename"])
-            # 画像がローカルになければダウンロード
-            if not os.path.exists(original_path):
-                # Blob URLから画像をダウンロード
-                print(f"Blob URLから画像をダウンロードします: {image_info['blob_url']}")
-                # 仮のダウンロード処理
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # 元画像情報 - upload_idまたはfilenameで検索
+        cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
+                      (request.image_id, request.image_id))
+        image_info = cursor.fetchone()
+        if not image_info:
+            print(f"画像が見つかりません: {request.image_id}")
+            raise HTTPException(status_code=404, detail="画像が見つかりません")
+        print(f"画像情報: {image_info}")
+        
+        # 画像のファイルパスを取得
+        original_path = os.path.join(UPLOAD_DIR, image_info["filename"])
+        # 画像がローカルになければダウンロード
+        if not os.path.exists(original_path):
+            # Blob URLから画像をダウンロード
+            print(f"Blob URLから画像をダウンロードします: {image_info['blob_url']}")
+            try:
                 import requests
                 response = requests.get(image_info["blob_url"])
                 if response.status_code == 200:
@@ -491,35 +582,42 @@ async def apply_material(request: MaterialRequest):
                     print(f"画像をダウンロードしました: {original_path}")
                 else:
                     print(f"画像のダウンロードに失敗: ステータスコード {response.status_code}")
-                    raise HTTPException(status_code=500, detail="画像のダウンロードに失敗しました")
-            
-            # マスク情報
-            cursor.execute("SELECT * FROM masks WHERE mask_id = %s", (request.mask_id,))
-            mask_info = cursor.fetchone()
-            if not mask_info:
-                print(f"マスクが見つかりません: {request.mask_id}")
-                raise HTTPException(status_code=404, detail="マスクが見つかりません")
-            print(f"マスク情報: {mask_info}")
-            
-            # 素材情報
-            # 注: products_imageテーブルを使うと仮定
-            # 仮定: material_idはproduct_idに対応
-            cursor.execute("SELECT * FROM products_image WHERE product_id = %s", (request.material_id,))
-            material_info = cursor.fetchone()
-            if not material_info:
-                print(f"素材が見つかりません: {request.material_id}")
-                raise HTTPException(status_code=404, detail="素材が見つかりません")
-            print(f"素材情報: {material_info}")
-
-            # 素材画像のパスを決定（仮定）
-            # 注: 実際にはmaterial_infoにimage_urlがあるため、そこからダウンロードする処理が必要
-            material_path = os.path.join(UPLOAD_DIR, f"materials/{material_info['product_id']}.jpg")
-            # 素材がローカルになければダウンロード
-            if not os.path.exists(material_path):
-                os.makedirs(os.path.dirname(material_path), exist_ok=True)
-                # Blob URLから画像をダウンロード
-                print(f"素材をダウンロードします: {material_info['image_url']}")
-                # 仮のダウンロード処理
+                    raise HTTPException(status_code=500, detail=f"画像のダウンロードに失敗しました: ステータスコード {response.status_code}")
+            except Exception as download_error:
+                print(f"画像ダウンロードエラー: {download_error}")
+                raise HTTPException(status_code=500, detail=f"画像ダウンロードエラー: {str(download_error)}")
+        
+        # マスク情報
+        cursor.execute("SELECT * FROM masks WHERE mask_id = %s", (request.mask_id,))
+        mask_info = cursor.fetchone()
+        if not mask_info:
+            print(f"マスクが見つかりません: {request.mask_id}")
+            raise HTTPException(status_code=404, detail="マスクが見つかりません")
+        print(f"マスク情報: {mask_info}")
+        
+        # 素材情報 - image_idまたはproduct_idで検索
+        cursor.execute("""
+            SELECT pi.*, p.category, p.series, p.color, p.price 
+            FROM products_image pi
+            JOIN products p ON pi.product_id = p.product_id
+            WHERE pi.image_id = %s OR pi.product_id = %s
+        """, (request.material_id, request.material_id))
+        material_info = cursor.fetchone()
+        if not material_info:
+            print(f"素材が見つかりません: {request.material_id}")
+            raise HTTPException(status_code=404, detail="素材が見つかりません")
+        print(f"素材情報: {material_info}")
+        
+        # 素材画像のパスを決定
+        materials_dir = os.path.join(UPLOAD_DIR, "materials")
+        os.makedirs(materials_dir, exist_ok=True)
+        material_filename = f"{material_info['product_id']}.jpg"
+        material_path = os.path.join(materials_dir, material_filename)
+        
+        # 素材がローカルになければダウンロード
+        if not os.path.exists(material_path):
+            print(f"素材をダウンロードします: {material_info['image_url']}")
+            try:
                 import requests
                 response = requests.get(material_info["image_url"])
                 if response.status_code == 200:
@@ -528,11 +626,10 @@ async def apply_material(request: MaterialRequest):
                     print(f"素材をダウンロードしました: {material_path}")
                 else:
                     print(f"素材のダウンロードに失敗: ステータスコード {response.status_code}")
-                    raise HTTPException(status_code=500, detail="素材のダウンロードに失敗しました")
-
-        finally:
-            cursor.close()
-            conn.close()
+                    raise HTTPException(status_code=500, detail=f"素材のダウンロードに失敗しました: ステータスコード {response.status_code}")
+            except Exception as download_error:
+                print(f"素材ダウンロードエラー: {download_error}")
+                raise HTTPException(status_code=500, detail=f"素材ダウンロードエラー: {str(download_error)}")
         
         # 合成処理
         result_id = str(uuid.uuid4())
@@ -553,24 +650,22 @@ async def apply_material(request: MaterialRequest):
         
         # 結果をデータベースに保存
         print("結果をデータベースに保存中...")
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                """
-                INSERT INTO results 
-                (result_id, image_id, mask_id, material_id, result_path, created_at) 
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                """,
-                (result_id, request.image_id, request.mask_id, request.material_id, result_path)
+        cursor.execute(
+            """
+            INSERT INTO results 
+            (result_id, image_id, mask_id, material_id, result_path, created_at) 
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                result_id, 
+                image_info["filename"],  # 一貫性のためfilename
+                request.mask_id, 
+                material_info["image_id"],  # 正しいmaterial_id（products_imageテーブルのimage_id）
+                result_path
             )
-            conn.commit()
-            print("結果保存成功")
-        except Error as e:
-            print(f"結果保存エラー: {e}")
-        finally:
-            cursor.close()
-            conn.close()
+        )
+        connection.commit()
+        print("結果保存成功")
         
         print(f"===== 素材適用API完了 =====")
         return {
@@ -581,11 +676,120 @@ async def apply_material(request: MaterialRequest):
         }
     
     except HTTPException:
+        # HTTPExceptionはそのまま再送
         raise
     except Exception as e:
         print(f"素材適用APIエラー: {e}")
         raise HTTPException(status_code=500, detail=f"素材適用エラー: {str(e)}")
+    finally:
+        # リソースの確実な解放
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+            
+
+
+# ▼▼▼以下、/4-preview画面での処理▼▼▼
+# Before/Afterボタン各々押下で適切な画像を表示
+@app.get("/api/preview/before/{image_id}")
+async def get_before_image(image_id: str):
+    """
+    元の画像（Before）を取得
+    """
+    print(f"===== Before画像取得: image_id {image_id} =====")
     
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # upload_idまたはfilenameで検索（filenameはそのまま検索）
+        cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
+                      (image_id, image_id))
+        image_info = cursor.fetchone()
+        
+        if not image_info:
+            print(f"画像が見つかりません: {image_id}")
+            raise HTTPException(status_code=404, detail="画像が見つかりません")
+        
+        print(f"画像情報: {image_info}")
+        
+        return {
+            "image_id": image_info["filename"],
+            "blob_url": image_info["blob_url"]
+        }
+    
+    except Exception as e:
+        print(f"Before画像取得エラー: {e}")
+        raise HTTPException(status_code=500, detail=f"Before画像取得エラー: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+
+@app.get("/api/preview/after/{image_id}/{mask_id}")
+async def get_after_image(image_id: str, mask_id: str):
+    """
+    合成後の画像（After）を取得
+    """
+    print(f"===== After画像取得: image_id {image_id}, mask_id {mask_id} =====")
+    
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # resultsテーブルから最新の合成画像を取得
+        # image_idはそのまま使用（拡張子を含む）
+        cursor.execute("""
+            SELECT * FROM results 
+            WHERE image_id = %s AND mask_id = %s 
+            ORDER BY created_at DESC LIMIT 1
+        """, (image_id, mask_id))
+        
+        result_info = cursor.fetchone()
+        
+        if not result_info:
+            print(f"合成画像が見つかりません: image_id={image_id}, mask_id={mask_id}")
+            # 画像が見つからない場合、代替として元の画像を取得することもできます
+            cursor.execute("SELECT * FROM upload_images WHERE filename = %s", (image_id,))
+            original_image = cursor.fetchone()
+            if original_image:
+                print(f"代替として元画像を返します: {original_image['filename']}")
+                return {
+                    "result_id": "original",
+                    "result_path": "",
+                    "public_url": original_image["blob_url"]
+                }
+            raise HTTPException(status_code=404, detail="合成画像が見つかりません")
+        
+        print(f"合成画像情報: {result_info}")
+        
+        # 結果画像のパスからURLを生成
+        result_path = result_info["result_path"]
+        public_url = f"/uploads/results/{result_info['result_id']}.jpg"
+        
+        return {
+            "result_id": result_info["result_id"],
+            "result_path": result_path,
+            "public_url": public_url
+        }
+    
+    except Exception as e:
+        print(f"After画像取得エラー: {e}")
+        raise HTTPException(status_code=500, detail=f"After画像取得エラー: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
 
 
 # 追加: ルートエンドポイント　よくわかんないけど必要らしいのでコメントアウト外した（4/4 羽田野）

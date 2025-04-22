@@ -4,7 +4,7 @@ click==8.1.8
 fastapi==0.115.11
 h11==0.14.0
 idna==3.10
-numpy>=1.26.0  # NumPyを先にインストール
+numpy==1.24.3  # NumPyを先にインストール
 opencv-python==4.9.0.80
 pydantic==2.10.6
 pydantic_core==2.27.2

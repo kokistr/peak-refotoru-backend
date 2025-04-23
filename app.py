@@ -26,13 +26,26 @@ app = FastAPI()
 if os.getenv("AZURE_ENVIRONMENT") != "production":
     load_dotenv()
 
-# CORSミドルウェアの設定
+# CORSミドルウェアの設定（修正：すべてのオリジンを許可）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://tech0-gen-8-step4-peak-front-d2ayf3aca3e3bcdu.canadacentral-01.azurewebsites.net"],
+    # 修正：許可するオリジンを追加
+    allow_origins=[
+        "https://tech0-gen-8-step4-peak-front-d2ayf3aca3e3bcdu.canadacentral-01.azurewebsites.net",
+        # 開発環境用
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "https://tech0-gen-8-step4-peak-front-d2ayf3aca3e3bcdu.z01.azurefd.net"
+    ],
+    # クレデンシャルを含むリクエストも許可
     allow_credentials=True,
+    # すべてのHTTPメソッドを許可
     allow_methods=["*"],
+    # すべてのヘッダーを許可
     allow_headers=["*"],
+    # プリフライトリクエストの結果をキャッシュする時間（秒）
+    max_age=3600,
 )
 
 # Azure Blob Storageの接続情報

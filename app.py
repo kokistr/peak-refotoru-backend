@@ -727,6 +727,15 @@ async def root():
     return {"message": "FastAPI is running on Azure!"}
 
 # ローカル開発環境でのみUvicornサーバーを起動
+# 修正前:
 if __name__ == "__main__" and os.getenv("AZURE_ENVIRONMENT") != "production":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+# 修正後:
+if __name__ == "__main__":
+    import uvicorn
+    
+    # 開発環境ではリロードを有効に
+    reload = os.getenv("AZURE_ENVIRONMENT") != "production"
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=reload)

@@ -36,7 +36,9 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
-        "https://tech0-gen-8-step4-peak-front-d2ayf3aca3e3bcdu.z01.azurefd.net"
+        "https://tech0-gen-8-step4-peak-front-d2ayf3aca3e3bcdu.z01.azurefd.net",
+        # ワイルドカードを追加（すべてのオリジンを許可）
+        "*"
     ],
     # クレデンシャルを含むリクエストも許可
     allow_credentials=True,
@@ -232,6 +234,8 @@ async def upload_image(file: UploadFile = File(...)):
             upload_date = datetime.now(jst).strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute(query, (filename, blob_url, upload_date))
             connection.commit()
+            # 結果を必ず消費する
+            cursor.fetchall()  # 結果がなくても呼び出す
         finally:
             cursor.close()
             connection.close()
@@ -305,7 +309,7 @@ async def process_mask(request: ProcessRequest):
             "SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
             (request.image_id, request.image_id)
         )
-        image_info = cursor.fetchone()
+        image_info = cursor.fetchone()  # 結果を消費
         
         if not image_info:
             raise HTTPException(status_code=404, detail="画像が見つかりません")
@@ -329,6 +333,12 @@ async def process_mask(request: ProcessRequest):
             (mask_id, image_info["filename"], mask_blob_url)  # mask_pathにBlobのURLを保存
         )
         connection.commit()
+        try:
+            # 結果セットを必ず消費
+            cursor.fetchall()
+        except mysql.connector.errors.InterfaceError:
+            # INSERT文では結果セットが返されないため、例外が発生する可能性がある
+            pass
         
         # Azureでのパブリックアクセス用URL
         public_url = mask_blob_url
@@ -445,7 +455,7 @@ async def get_materials_by_category(category: str):
         
         # データベースの全カテゴリを確認（デバッグ用）
         cursor.execute("SELECT DISTINCT category FROM products")
-        categories = cursor.fetchall()
+        categories = cursor.fetchall()  # 結果を消費
         print(f"データベースの全カテゴリ: {[cat['category'] for cat in categories]}")
         
         # カテゴリに合致する素材を取得
@@ -460,18 +470,18 @@ async def get_materials_by_category(category: str):
         print(f"実行するSQL: {query} パラメータ: [{category}]")
         cursor.execute(query, (category,))
         
-        materials = cursor.fetchall()
+        materials = cursor.fetchall()  # 結果を消費
         print(f"クエリ結果: {len(materials)}件")
         
         if not materials:
             # カテゴリに関するさらなる情報を取得
             cursor.execute("SELECT COUNT(*) as count FROM products WHERE category = %s", (category,))
-            cat_count = cursor.fetchone()
+            cat_count = cursor.fetchone()  # 結果を消費
             print(f"category={category}の商品は{cat_count['count']}件存在します")
             
             # products_imageテーブルのチェック
             cursor.execute("SELECT COUNT(*) as count FROM products_image")
-            img_count = cursor.fetchone()
+            img_count = cursor.fetchone()  # 結果を消費
             print(f"products_imageテーブルには{img_count['count']}件のレコードが存在します")
             
             print(f"カテゴリ[{category}]の素材が見つかりません")
@@ -527,13 +537,13 @@ async def apply_material(request: MaterialRequest):
         # 元画像情報 - upload_idまたはfilenameで検索
         cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
                       (request.image_id, request.image_id))
-        image_info = cursor.fetchone()
+        image_info = cursor.fetchone()  # 結果を消費
         if not image_info:
             raise HTTPException(status_code=404, detail="画像が見つかりません")
         
         # マスク情報
         cursor.execute("SELECT * FROM masks WHERE mask_id = %s", (request.mask_id,))
-        mask_info = cursor.fetchone()
+        mask_info = cursor.fetchone()  # 結果を消費
         if not mask_info:
             raise HTTPException(status_code=404, detail="マスクが見つかりません")
         
@@ -544,7 +554,7 @@ async def apply_material(request: MaterialRequest):
             JOIN products p ON pi.product_id = p.product_id
             WHERE pi.image_id = %s OR pi.product_id = %s
         """, (request.material_id, request.material_id))
-        material_info = cursor.fetchone()
+        material_info = cursor.fetchone()  # 結果を消費
         if not material_info:
             raise HTTPException(status_code=404, detail="素材が見つかりません")
         
@@ -608,6 +618,12 @@ async def apply_material(request: MaterialRequest):
             )
         )
         connection.commit()
+        try:
+            # 結果セットを必ず消費
+            cursor.fetchall()
+        except mysql.connector.errors.InterfaceError:
+            # INSERT文では結果セットが返されないため、例外が発生する可能性がある
+            pass
         
         # 一時ファイルの削除
         for path in [temp_original_path, temp_mask_path, temp_material_path]:
@@ -649,7 +665,7 @@ async def get_before_image(image_id: str):
         # upload_idまたはfilenameで検索
         cursor.execute("SELECT * FROM upload_images WHERE upload_id = %s OR filename = %s", 
                       (image_id, image_id))
-        image_info = cursor.fetchone()
+        image_info = cursor.fetchone()  # 結果を消費
         
         if not image_info:
             raise HTTPException(status_code=404, detail="画像が見つかりません")
@@ -689,13 +705,13 @@ async def get_after_image(image_id: str, mask_id: str):
             ORDER BY created_at DESC LIMIT 1
         """, (image_id, mask_id))
         
-        result_info = cursor.fetchone()
+        result_info = cursor.fetchone()  # 結果を消費
         
         if not result_info:
             print(f"合成画像が見つかりません: image_id={image_id}, mask_id={mask_id}")
             # 画像が見つからない場合、代替として元の画像を取得
             cursor.execute("SELECT * FROM upload_images WHERE filename = %s", (image_id,))
-            original_image = cursor.fetchone()
+            original_image = cursor.fetchone()  # 結果を消費
             if original_image:
                 print(f"代替として元画像を返します: {original_image['filename']}")
                 return {
@@ -726,11 +742,12 @@ async def get_after_image(image_id: str, mask_id: str):
 async def root():
     return {"message": "FastAPI is running on Azure!"}
 
-# ローカル開発環境でのみUvicornサーバーを起動
-# 修正後:
+# FastAPIアプリ実行（開発環境と本番環境の両方で対応）
 if __name__ == "__main__":
     import uvicorn
-    
+    # 環境変数からポートを取得（デフォルトは8000）
+    port = int(os.getenv("PORT", "8000"))
     # 開発環境ではリロードを有効に
     reload = os.getenv("AZURE_ENVIRONMENT") != "production"
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=reload)
+    # Uvicornサーバーを起動
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=reload)
